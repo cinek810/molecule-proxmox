@@ -1,0 +1,8 @@
+---
+driver:
+  name: delegated
+platforms:
+  - name: Alma8
+    template: Alma8-template
+    template_id: XX
+

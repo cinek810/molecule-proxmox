@@ -1,0 +1,43 @@
+---
+- name: Destroy
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    instances: '{{ lookup("file", molecule_instance_config, errors="ignore") | from_yaml }}'
+    proxmox_conf:
+      api_host: '{{ lookup("env", "PROXMOX_API_HOST") }}'
+      api_user: '{{ lookup("env", "PROXMOX_API_USER") }}'
+      api_token_id: '{{ lookup("env", "PROXMOX_API_TOKEN_ID") }}'
+      api_token_secret: '{{ lookup("env", "PROXMOX_API_TOKEN_SECRET") }}'
+      node: '{{ lookup("env", "PROXMOX_API_NODE") }}'
+
+  no_log: '{{ molecule_no_log }}'
+  tasks:
+    - name: Shutdown instances
+      community.general.proxmox_kvm:
+        api_host: '{{ proxmox_conf.api_host }}'
+        api_user: '{{ proxmox_conf.api_user }}'
+        api_token_id: '{{ proxmox_conf.api_token_id }}'
+        api_token_secret: '{{ proxmox_conf.api_token_secret }}'
+        proxmox_default_behavior: compatibility
+        timeout: 300
+        vmid: '{{ item.vmid }}'
+        node: '{{ proxmox_conf.node }}'
+        state: stopped
+      with_items: '{{ instances }}'
+      when: instances != ''
+
+    - name: Remove instances
+      community.general.proxmox_kvm:
+        api_host: '{{ proxmox_conf.api_host }}'
+        api_user: '{{ proxmox_conf.api_user }}'
+        api_token_id: '{{ proxmox_conf.api_token_id }}'
+        api_token_secret: '{{ proxmox_conf.api_token_secret }}'
+        proxmox_default_behavior: compatibility
+        node: '{{ proxmox_conf.node }}'
+        vmid: '{{ item.vmid }}'
+        state: absent
+        force: yes
+      with_items: '{{ instances }}'
+      when: instances != 

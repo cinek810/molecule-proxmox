@@ -1,0 +1,133 @@
+---
+- name: Create
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  no_log: '{{ molecule_no_log }}'
+  vars:
+    jms_addresses: "result[? name!='lo'].\"ip-addresses\""
+    jms_ipv4: "[0][? \"ip-address-type\"=='ipv4'].\"ip-address\""
+    ci_job_id: '{{ lookup("env", "CI_JOB_ID") | default("nonci") }}'
+    proxmox_conf:
+      api_host: '{{ lookup("env", "PROXMOX_API_HOST") }}'
+      api_user: '{{ lookup("env", "PROXMOX_API_USER") }}'
+      api_token_id: '{{ lookup("env", "PROXMOX_API_TOKEN_ID") }}'
+      api_token_secret: '{{ lookup("env", "PROXMOX_API_TOKEN_SECRET") }}'
+      node: '{{ lookup("env", "PROXMOX_API_NODE") }}'
+
+  tasks:
+    - name: Clone & start templates
+      community.general.proxmox_kvm:
+        api_host: '{{ proxmox_conf.api_host }}'
+        api_user: '{{ proxmox_conf.api_user }}'
+        api_token_id: '{{ proxmox_conf.api_token_id }}'
+        api_token_secret: '{{ proxmox_conf.api_token_secret }}'
+        proxmox_default_behavior: compatibility
+        clone: '{{ item.template }}'
+        full: no
+        format: unspecified
+        node: '{{ proxmox_conf.node }}'
+        newid: '{{ range(30000,60000) | random }}'
+        name: '{{ci_job_id}}{{proxmox_conf.api_user)}}{{item.name}}'
+        vmid: '{{ item.template_id }}'
+        timeout: 600
+      register: clone
+      with_items: '{{ molecule_yml.platforms }}'
+      loop_control:
+        pause: 2
+
+    - name: Set network
+      ansible.builtin.uri:
+        headers:
+          # yamllint disable rule:quoted-strings
+          # yamllint disable rule:line-length
+          Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
+        url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{node}}/qemu/{{ item.vmid }}/config'
+        # yamllint enable rule:quoted-strings
+        # yamllint enable rule:line-length
+        validate_certs: no
+        method: PUT
+        body:
+          net0: 'virtio,bridge=vmbr871'
+        body_format: 'form-urlencoded'
+      with_items: '{{ clone.results }}'
+      register: vmdetails
+
+    - name: Show clone results
+      ansible.builtin.debug:
+        var: clone
+
+    - name: Start cloned machines
+      community.general.proxmox_kvm:
+        api_host: '{{ proxmox_conf.api_host }}'
+        api_user: '{{ proxmox_conf.api_user }}'
+        api_token_id: '{{ proxmox_conf.api_token_id }}'
+        api_token_secret: '{{ proxmox_conf.api_token_secret }}'
+        proxmox_default_behavior: compatibility
+        vmid: '{{ item.vmid }}'
+        state: started
+      with_items: '{{ clone.results }}'
+    - name: Get VM state
+      community.general.proxmox_kvm:
+        api_host: '{{ proxmox_conf.api_host }}'
+        api_user: '{{ proxmox_conf.api_user }}'
+        api_token_id: '{{ proxmox_conf.api_token_id }}'
+        api_token_secret: '{{ proxmox_conf.api_token_secret }}'
+        proxmox_default_behavior: compatibility
+        state: current
+        vmid: '{{ item.vmid }}'
+      register: vmstate
+      with_items: '{{ clone.results }}'
+      loop_control:
+        pause: 1
+    - name: Show state
+      ansible.builtin.debug:
+        var: item
+      with_items: '{{ vmstate.results }}'
+
+    - name: Get VM details
+      ansible.builtin.uri:
+        headers:
+          # yamllint disable rule:quoted-strings
+          # yamllint disable rule:line-length
+          Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
+        url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{node}}/qemu/{{ item.vmid }}/agent/network-get-interfaces'
+        # yamllint enable rule:quoted-strings
+        # yamllint enable rule:line-length
+        validate_certs: no
+      with_items: '{{ clone.results }}'
+      until:
+        - vmdetails.status == 200
+        - "{{ vmdetails.json.data | json_query(jms_addresses) | json_query(jms_ipv4) }}"
+      retries: 20
+      delay: 1
+      register: vmdetails
+
+    - name: Populate instance config dict
+      set_fact:
+        instance_conf_dict: {
+          'instance': '{{ item.2.name }}',
+          'vmid': '{{ item.1.vmid }}',
+          'address': '{{ item.0.json.data | json_query(jms_addresses) | json_query(jms_ipv4) | first }}',
+          'user': molecule,
+          'port': '22',
+          'password': moleculePassword}
+      with_together:
+        - '{{ vmdetails.results }}'
+        - '{{ clone.results }}'
+        - '{{ molecule_yml.platforms }}'
+      register: instance_config_dict
+
+    - name: Convert instance config dict to a list
+      set_fact:
+        instance_conf: '{{ instance_config_dict.results | map(attribute="ansible_facts.instance_conf_dict") | list }}'
+
+    - name: Dump instance config
+      copy:
+        content: |
+          # Molecule managed
+
+          {{ instance_conf | to_nice_yaml(indent=2, width=1337) }}
+        dest: '{{ molecule_instance_config }}'
+        mode: 0o600
+

@@ -67,23 +67,6 @@
         vmid: '{{ item.vmid }}'
         state: started
       with_items: '{{ clone.results }}'
-    - name: Get VM state
-      community.general.proxmox_kvm:
-        api_host: '{{ proxmox_conf.api_host }}'
-        api_user: '{{ proxmox_conf.api_user }}'
-        api_token_id: '{{ proxmox_conf.api_token_id }}'
-        api_token_secret: '{{ proxmox_conf.api_token_secret }}'
-        proxmox_default_behavior: compatibility
-        state: current
-        vmid: '{{ item.vmid }}'
-      register: vmstate
-      with_items: '{{ clone.results }}'
-      loop_control:
-        pause: 1
-    - name: Show state
-      ansible.builtin.debug:
-        var: item
-      with_items: '{{ vmstate.results }}'
 
     - name: Get VM details
       ansible.builtin.uri:

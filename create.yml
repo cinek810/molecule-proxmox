@@ -86,6 +86,16 @@
       delay: 1
       register: vmdetails
 
+    - name: Wait for connection
+        wait_for:
+          host: '{{ item.json.data | json_query(jms_addresses) | json_query(jms_ipv4) | first }}'
+          port: 22
+          search_regex: OpenSSH
+          delay: 2
+          timeout: 60
+        with_items:
+          - '{{ vmdetails.results }}'
+
     - name: Populate instance config dict
       set_fact:
         instance_conf_dict: {

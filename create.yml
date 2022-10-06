@@ -16,111 +16,194 @@
       node: '{{ lookup("env", "PROXMOX_API_NODE") }}'
 
   tasks:
-    - name: Clone & start templates
-      community.general.proxmox_kvm:
-        api_host: '{{ proxmox_conf.api_host }}'
-        api_user: '{{ proxmox_conf.api_user }}'
-        api_token_id: '{{ proxmox_conf.api_token_id }}'
-        api_token_secret: '{{ proxmox_conf.api_token_secret }}'
-        proxmox_default_behavior: compatibility
-        clone: '{{ item.template }}'
-        full: no
-        format: unspecified
-        node: '{{ proxmox_conf.node }}'
-        newid: '{{ range(30000,60000) | random }}'
-        name: '{{ci_job_id}}{{proxmox_conf.api_user)}}{{item.name}}'
-        vmid: '{{ item.template_id }}'
-        timeout: 600
-      register: clone
+    - name: Clone templates
+      ansible.builtin.uri:
+        headers:
+          # yamllint disable rule:quoted-strings
+          # yamllint disable rule:line-length
+          Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
+        url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{ node }}/qemu/{{ item.template_id }}/clone'
+        # yamllint enable rule:quoted-strings
+        # yamllint enable rule:line-length
+        validate_certs: no
+        method: POST
+        body:
+          newid: '{{ range(30000,60000) | random }}'
+          full: no
+          name: '{{ci_job_id}}{{proxmox_conf.api_user }}{{item.name}}'
+          description:  '{{ item.template }}'
+        body_format: 'json'
       with_items: '{{ molecule_yml.platforms }}'
       loop_control:
         pause: 2
+      register: clone_result
 
-    - name: Set network
-      ansible.builtin.uri:
-        headers:
-          # yamllint disable rule:quoted-strings
-          # yamllint disable rule:line-length
-          Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
-        url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{node}}/qemu/{{ item.vmid }}/config'
-        # yamllint enable rule:quoted-strings
-        # yamllint enable rule:line-length
-        validate_certs: no
-        method: PUT
-        body:
-          net0: 'virtio,bridge=vmbr871'
-        body_format: 'form-urlencoded'
-      with_items: '{{ clone.results }}'
-      register: vmdetails
+    - name: Tasks executed after clone was created
+      block:
+        - name: Clone results
+          debug:
+            var: clone_result.results
 
-    - name: Show clone results
-      ansible.builtin.debug:
-        var: clone
+        - name: Show clone results
+          ansible.builtin.debug:
+            var: item.invocation.module_args.body.newid
+          with_items: '{{ clone_result.results }}'
 
-    - name: Start cloned machines
-      community.general.proxmox_kvm:
-        api_host: '{{ proxmox_conf.api_host }}'
-        api_user: '{{ proxmox_conf.api_user }}'
-        api_token_id: '{{ proxmox_conf.api_token_id }}'
-        api_token_secret: '{{ proxmox_conf.api_token_secret }}'
-        proxmox_default_behavior: compatibility
-        vmid: '{{ item.vmid }}'
-        state: started
-      with_items: '{{ clone.results }}'
+        - name: Create a list of new VMID's
+          set_fact:
+            cloned_ids: "{{ cloned_ids|default([]) + [{'vmid': item.invocation.module_args.body.newid, 'snapname': item.invocation.module_args.body.description}] }}"
+          with_items: '{{ clone_result.results }}'
 
-    - name: Get VM details
-      ansible.builtin.uri:
-        headers:
-          # yamllint disable rule:quoted-strings
-          # yamllint disable rule:line-length
-          Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
-        url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{node}}/qemu/{{ item.vmid }}/agent/network-get-interfaces'
-        # yamllint enable rule:quoted-strings
-        # yamllint enable rule:line-length
-        validate_certs: no
-      with_items: '{{ clone.results }}'
-      until:
-        - vmdetails.status == 200
-        - "{{ vmdetails.json.data | json_query(jms_addresses) | json_query(jms_ipv4) }}"
-      retries: 20
-      delay: 1
-      register: vmdetails
+        - name: Show cloned ids
+          debug:
+            var: cloned_ids
 
-    - name: Wait for connection
-        wait_for:
-          host: '{{ item.json.data | json_query(jms_addresses) | json_query(jms_ipv4) | first }}'
-          port: 22
-          search_regex: OpenSSH
+        - name: Set network
+          ansible.builtin.uri:
+            headers:
+              # yamllint disable rule:quoted-strings
+              # yamllint disable rule:line-length
+              Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
+            url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{ node }}/qemu/{{ item.vmid }}/config'
+            # yamllint enable rule:quoted-strings
+            # yamllint enable rule:line-length
+            validate_certs: no
+            method: PUT
+            body:
+              net0: 'virtio,bridge=vmbr871'
+            body_format: 'form-urlencoded'
+          with_items: '{{ cloned_ids }}'
+          register: vmdetails
+
+        - name: Start cloned machines
+          community.general.proxmox_kvm:
+            api_host: '{{ proxmox_conf.api_host }}'
+            api_user: '{{ proxmox_conf.api_user }}'
+            api_token_id: '{{ proxmox_conf.api_token_id }}'
+            api_token_secret: '{{ proxmox_conf.api_token_secret }}'
+            proxmox_default_behavior: compatibility
+            vmid: '{{ item.vmid }}'
+            state: started
+          with_items: '{{ cloned_ids }}'
+
+        - name: Get VM details - wait for VM to boot, the IP address happens to be temporary
+          ansible.builtin.uri:
+            headers:
+              # yamllint disable rule:quoted-strings
+              # yamllint disable rule:line-length
+              Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
+            url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{ node }}/qemu/{{ item.vmid }}/agent/network-get-interfaces'
+            # yamllint enable rule:quoted-strings
+            # yamllint enable rule:line-length
+            validate_certs: no
+          with_items: '{{ cloned_ids }}'
+          until:
+            - vmdetails_tmp.status == 200
+          retries: 60
+          delay: 1
+          register: vmdetails_tmp
+
+        - name: Pause
+          pause:
+            minutes: 2
+
+        - name: Get VM details
+          ansible.builtin.uri:
+            headers:
+              # yamllint disable rule:quoted-strings
+              # yamllint disable rule:line-length
+              Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
+            url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{ node }}/qemu/{{ item.vmid }}/agent/network-get-interfaces'
+            # yamllint enable rule:quoted-strings
+            # yamllint enable rule:line-length
+            validate_certs: no
+          with_items: '{{ cloned_ids }}'
+          until:
+            - vmdetails.status == 200
+            - "{{ vmdetails.json.data | json_query(jms_addresses) | json_query(jms_ipv4) }}"
+          retries: 120
+          delay: 1
+          register: vmdetails
+          ignore_errors: yes
+
+        - name: Populate instance config dict
+          set_fact:
+            instance_conf_dict: {
+              'instance': '{{ item.2.name }}',
+              'vmid': '{{ item.1.vmid }}',
+              'address': '{{ item.0.json.data | json_query(jms_addresses) | json_query(jms_ipv4) | first }}',
+              'user': molecule,
+              'port': '22',
+              'password': moleculePassword}
+          with_together:
+            - '{{ vmdetails.results }}'
+            - '{{ cloned_ids }}'
+            - '{{ molecule_yml.platforms }}'
+          register: instance_config_dict
+
+        - name: Convert instance config dict to a list
+          set_fact:
+            instance_conf: '{{ instance_config_dict.results | map(attribute="ansible_facts.instance_conf_dict") | list }}'
+
+        - name: Dump instance config
+          copy:
+            content: |
+              # Molecule managed
+
+              {{ instance_conf | to_nice_yaml(indent=2, width=1337) }}
+            dest: '{{ molecule_instance_config }}'
+            mode: 0o600
+
+        - name: Wait for SSH connection
+          wait_for:
+            host: '{{ item.ansible_facts.instance_conf_dict.address }}'
+            port: 22
+            search_regex: OpenSSH
           delay: 2
-          timeout: 60
-        with_items:
-          - '{{ vmdetails.results }}'
+          with_items: '{{ instance_config_dict.results }}'
 
-    - name: Populate instance config dict
-      set_fact:
-        instance_conf_dict: {
-          'instance': '{{ item.2.name }}',
-          'vmid': '{{ item.1.vmid }}',
-          'address': '{{ item.0.json.data | json_query(jms_addresses) | json_query(jms_ipv4) | first }}',
-          'user': molecule,
-          'port': '22',
-          'password': moleculePassword}
-      with_together:
-        - '{{ vmdetails.results }}'
-        - '{{ clone.results }}'
-        - '{{ molecule_yml.platforms }}'
-      register: instance_config_dict
+        - name: Drop previos ssh key of the host
+          command: ssh-keygen -R '{{ item.ansible_facts.instance_conf_dict.address }}'
+          with_items: '{{ instance_config_dict.results }}'
+      rescue:
+        - name: Stop VM (we failed after clone, maybe after start too)
+          ansible.builtin.uri:
+            headers:
+              # yamllint disable rule:quoted-strings
+              # yamllint disable rule:line-length
+              Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
+            url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{ node }}/qemu/{{ item.invocation.module_args.body.newid }}/status/stop'
+            # yamllint enable rule:quoted-strings
+            # yamllint enable rule:line-length
+            validate_certs: no
+            method: POST
+          with_items: '{{ clone_result.results }}'
+          when: clone_result.results != ''
+          delegate_to: 127.0.0.1
+          register: shutdown_result
+          failed_when:
+            - '"does not exist in cluster" not in shutdown_result.msg'
+            - '"is shutting down" not in shutdown_result.msg'
+            - '"OK" not in shutdown_result.msg'
 
-    - name: Convert instance config dict to a list
-      set_fact:
-        instance_conf: '{{ instance_config_dict.results | map(attribute="ansible_facts.instance_conf_dict") | list }}'
+        - name: Remove the clone from proxmx (we failed after clone)
+          ansible.builtin.uri:
+            headers:
+              # yamllint disable rule:quoted-strings
+              # yamllint disable rule:line-length
+              Authorization: 'PVEAPIToken={{ proxmox_conf.api_user }}!{{ proxmox_conf.api_token_id }}={{ proxmox_conf.api_token_secret }}'
+            url: 'https://{{ proxmox_conf.api_host }}/api2/json/nodes/{{ node }}/qemu/{{ item.invocation.module_args.body.newid }}'
+            # yamllint enable rule:quoted-strings
+            # yamllint enable rule:line-length
+            validate_certs: no
+            method: DELETE
+          with_items: '{{ clone_result.results }}'
+          register: delete_result
+          when: clone_result != ''
+          delegate_to: 127.0.0.1
+          failed_when: delete_result.status != 200 and "does not exist" not in delete_result.msg
 
-    - name: Dump instance config
-      copy:
-        content: |
-          # Molecule managed
-
-          {{ instance_conf | to_nice_yaml(indent=2, width=1337) }}
-        dest: '{{ molecule_instance_config }}'
-        mode: 0o600
+        - name: Fail at the end so molecule knows that create operation failed
+          fail:
+            msg: Failure after VM cloned, check the tasks before rescue block
 
